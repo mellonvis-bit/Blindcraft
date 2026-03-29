@@ -1,0 +1,2110 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Blindcraft v2.4</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            touch-action: none;
+        }
+
+        #game-container {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            position: relative;
+        }
+
+        canvas {
+            display: block;
+        }
+
+        /* ─── UI Overlay tetap di pojok ─── */
+        .ui-info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 6px 14px;
+            border-radius: 8px;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-size: 12px;
+            pointer-events: none;
+            backdrop-filter: blur(5px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            z-index: 20;
+        }
+
+        #minimap-canvas {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.25);
+            background: rgba(0,0,0,0.4);
+            z-index: 20;
+            pointer-events: none;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <div class="ui-info" id="uiInfo" style="display:none;"></div>
+    <canvas id="gameCanvas"></canvas>
+    <canvas id="minimap-canvas" width="130" height="130"></canvas>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // ─── KONSTANTA ───────────────────────────────────────────────
+    const TILE_SIZE      = 40;
+    const MOVE_DELAY     = 680;   // ms per langkah player (logika)
+    const MOB_MOVE_DELAY = 700;   // ms per langkah ayam (logika)
+    const JOYSTICK_R     = 52;
+    const HAND_DRAG_MAX  = 65;
+    const MOB_COUNT      = 5;     // jumlah ayam
+    const SPAWN_RADIUS   = 8;     // radius spawn dalam tile dari origin
+    // Jarak max suara terdengar (dalam tile)
+    const AUDIO_MAX_DIST = 20;
+
+    // ─── KECEPATAN ANIMASI GERAK SMOOTH (tile/detik) ─────────────
+    // renderX/Y mengejar tileX/Y dengan kecepatan ini → gerakan mulus
+    const PLAYER_MOVE_SPEED = 7;   // player: ~143ms per tile
+    const MOB_MOVE_SPEED    = 5.5; // mob normal: ~182ms per tile
+    const MOB_FLEE_SPEED    = 9;   // mob lari: ~111ms per tile
+
+    // ─── KONSTANTA SENJATA ────────────────────────────────────────
+    const GUN_RADIUS_RANGE  = 230;  // radius pistol (diperbesar)
+    const MAX_AMMO          = 3;
+    const RELOAD_DURATION   = 2000; // ms
+    const GUN_SHOT_DURATION = 300;  // ms laser line tampil
+    const SWIPE_THRESHOLD   = 22;   // min px untuk dianggap swipe
+    const DOUBLE_TAP_MS     = 340;  // batas waktu double-tap
+
+    // ─── RADIUS PENDENGARAN (dalam tile) ──────────────────────────
+    // Mobs hanya terdengar jika berada di dalam radius ini
+    const HEARING_RADIUS_TILES = 10;
+
+    // ─── WEB AUDIO CONTEXT (3D Spatial Audio) ─────────────────────
+    let audioCtx = null;
+    const audioBuffers = {};  // cache decoded buffer
+
+    function getAudioCtx() {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        return audioCtx;
+    }
+
+    // Load & decode mp3 ke buffer
+    async function loadBuffer(url) {
+        if (audioBuffers[url]) return audioBuffers[url];
+        try {
+            const res = await fetch(url);
+            const arr = await res.arrayBuffer();
+            const buf = await getAudioCtx().decodeAudioData(arr);
+            audioBuffers[url] = buf;
+            return buf;
+        } catch(e) { return null; }
+    }
+
+    // Preload semua file audio
+    async function preloadAudio() {
+        await Promise.all([
+            loadBuffer('jalan.mp3'),
+            loadBuffer('jalan 1.mp3'),
+            loadBuffer('jalan 2.mp3'),
+            loadBuffer('jalan hutan.mp3'),
+            loadBuffer('jalan pasir.mp3'),
+            loadBuffer('ayam 1.mp3'),
+            loadBuffer('ayam 2.mp3'),
+            loadBuffer('angin.mp3'),
+            loadBuffer('ayam mati.mp3'),
+            loadBuffer('kena.mp3'),
+            loadBuffer('menghindar.mp3'),
+            loadBuffer('senjata 1.mp3'),
+            loadBuffer('reload senjata 1.mp3'),
+            loadBuffer('tangan.mp3'),
+            loadBuffer('bcksound.mp3'),
+            loadBuffer('air sungai.mp3'),
+        ]);
+    }
+
+    // Putar buffer dengan posisi 3D (dx, dy dalam satuan tile relatif ke player)
+    // dx positif = kanan, negatif = kiri; dy positif = bawah
+    function play3D(url, dx, dy, volume = 1.0) {
+        const buf = audioBuffers[url];
+        if (!buf) return;
+        try {
+            const ctx3d  = getAudioCtx();
+            const source = ctx3d.createBufferSource();
+            source.buffer = buf;
+
+            const panner = ctx3d.createPanner();
+            panner.panningModel    = 'HRTF';
+            panner.distanceModel   = 'inverse';
+            panner.refDistance     = 1;
+            panner.maxDistance     = AUDIO_MAX_DIST;
+            panner.rolloffFactor   = 1.2;
+
+            // Posisi 3D: x=kiri-kanan, y=atas-bawah(0), z=depan-belakang
+            panner.positionX.setValueAtTime(dx,  ctx3d.currentTime);
+            panner.positionY.setValueAtTime(0,   ctx3d.currentTime);
+            panner.positionZ.setValueAtTime(dy,  ctx3d.currentTime);
+
+            const gainNode = ctx3d.createGain();
+            gainNode.gain.value = volume;
+
+            source.connect(panner);
+            panner.connect(gainNode);
+            gainNode.connect(ctx3d.destination);
+            source.start(0);
+        } catch(e) {}
+    }
+
+    // ─── AUDIO PLAYER (suara langkah player, tanpa 3D — posisi di tengah) ──
+    // Di bioma hutan / hutan_tropis: pakai jalan hutan.mp3
+    // Di bioma gurun: pakai jalan pasir.mp3
+    // Bioma lain: pakai jalan.mp3
+    function playPlayerStep() {
+        const biome = getBiome(player.tileX, player.tileY);
+        if (biome === 'hutan' || biome === 'hutan_tropis') {
+            play3D('jalan hutan.mp3', 0, 0, 1.0);
+        } else if (biome === 'gurun') {
+            play3D('jalan pasir.mp3', 0, 0, 1.0);
+        } else {
+            play3D('jalan.mp3', 0, 0, 1.0);
+        }
+    }
+
+    // Unlock AudioContext pada sentuhan pertama
+    let audioUnlocked = false;
+
+    // ─── BACKSOUND MENU ───────────────────────────────────────────
+    let bgmSource = null;
+    let bgmGain   = null;
+    let bgmLoaded = false;
+
+    async function startBacksound() {
+        if (bgmSource) return;
+        try {
+            const buf = await loadBuffer('bcksound.mp3');
+            if (!buf) return;
+            const ctx3d = getAudioCtx();
+            bgmSource         = ctx3d.createBufferSource();
+            bgmSource.buffer  = buf;
+            bgmSource.loop    = true;
+            bgmGain           = ctx3d.createGain();
+            bgmGain.gain.value = 0.06; // lebih samar
+            bgmSource.connect(bgmGain);
+            bgmGain.connect(ctx3d.destination);
+            bgmSource.start(0);
+            bgmLoaded = true;
+        } catch(e) {}
+    }
+
+    function stopBacksound() {
+        if (bgmSource) {
+            try {
+                bgmGain.gain.setTargetAtTime(0, getAudioCtx().currentTime, 0.3);
+                const s = bgmSource;
+                setTimeout(() => { try { s.stop(); } catch(e){} }, 500);
+            } catch(e) {}
+            bgmSource = null;
+            bgmGain   = null;
+        }
+    }
+
+    // ─── BACKSOUND GAMEPLAY (volume kecil agar tidak mengganggu) ──
+    let gameBgmSource = null;
+    let gameBgmGain   = null;
+
+    async function startGameBGM() {
+        if (gameBgmSource) return;
+        try {
+            const buf = await loadBuffer('bcksound.mp3');
+            if (!buf) return;
+            const ctx3d     = getAudioCtx();
+            gameBgmSource         = ctx3d.createBufferSource();
+            gameBgmSource.buffer  = buf;
+            gameBgmSource.loop    = true;
+            gameBgmGain           = ctx3d.createGain();
+            gameBgmGain.gain.value = 0.007; // sangat samar, tidak mengganggu SFX
+            gameBgmSource.connect(gameBgmGain);
+            gameBgmGain.connect(ctx3d.destination);
+            gameBgmSource.start(0);
+        } catch(e) {}
+    }
+
+    function stopGameBGM() {
+        if (gameBgmSource) {
+            try {
+                gameBgmGain.gain.setTargetAtTime(0, getAudioCtx().currentTime, 0.5);
+                const s = gameBgmSource;
+                setTimeout(() => { try { s.stop(); } catch(e){} }, 700);
+            } catch(e) {}
+            gameBgmSource = null;
+            gameBgmGain   = null;
+        }
+    }
+
+    // ─── SIKLUS HARI/MALAM ────────────────────────────────────────
+    // Total 1 hari = 15 menit
+    //   Pagi  (05–09) = 3 menit
+    //   Siang (09–17) = 6 menit
+    //   Sore  (17–19) = 2 menit
+    //   Malam (19–05) = 4 menit
+    const DAY_PAGI_MS  = 3 * 60 * 1000;
+    const DAY_SIANG_MS = 6 * 60 * 1000;
+    const DAY_SORE_MS  = 2 * 60 * 1000;
+    const DAY_MALAM_MS = 4 * 60 * 1000;
+    const DAY_TOTAL_MS = DAY_PAGI_MS + DAY_SIANG_MS + DAY_SORE_MS + DAY_MALAM_MS; // 15 menit
+
+    let dayStartTime = 0; // diisi saat game dimulai
+
+    // Kembalikan fase dan progress t∈[0,1] dalam fase itu
+    function getDayPhase(timestamp) {
+        if (dayStartTime === 0) return { name: 'siang', t: 0 };
+        const elapsed = (timestamp - dayStartTime) % DAY_TOTAL_MS;
+        const phases = [
+            { name: 'pagi',  dur: DAY_PAGI_MS  },
+            { name: 'siang', dur: DAY_SIANG_MS },
+            { name: 'sore',  dur: DAY_SORE_MS  },
+            { name: 'malam', dur: DAY_MALAM_MS },
+        ];
+        let acc = 0;
+        for (const p of phases) {
+            if (elapsed < acc + p.dur) {
+                return { name: p.name, t: (elapsed - acc) / p.dur };
+            }
+            acc += p.dur;
+        }
+        return { name: 'malam', t: 1 };
+    }
+
+    // Bintang statis (posisi fraksional layar)
+    const STARS = [
+        [0.05,0.04],[0.14,0.07],[0.28,0.03],[0.38,0.08],[0.50,0.05],
+        [0.61,0.09],[0.72,0.03],[0.84,0.06],[0.93,0.10],[0.09,0.14],
+        [0.20,0.11],[0.45,0.13],[0.67,0.12],[0.88,0.04],[0.55,0.15],
+    ];
+
+    // Gambar bulan & bintang (dipanggil dari overlay saat malam)
+    function drawMoonAndStars(W, H, alpha) {
+        const fadeIn = Math.min(1, (alpha - 0.15) / 0.30);
+        if (fadeIn <= 0) return;
+
+        // Bulan — pojok atas kanan, hanya tampil di zona atas (langit)
+        const mx = W * 0.83;
+        const my = H * 0.11;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(mx, my, 19, 0, Math.PI * 2);
+        ctx.fillStyle   = `rgba(225, 232, 255, ${fadeIn * 0.92})`;
+        ctx.shadowBlur  = 40;
+        ctx.shadowColor = `rgba(190, 210, 255, ${fadeIn * 0.80})`;
+        ctx.fill();
+        ctx.shadowBlur = 0;
+
+        // Sabit bulan (bayangan gelap kecil di sisi kanan)
+        ctx.beginPath();
+        ctx.arc(mx + 8, my - 2, 15, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(8, 12, 40, ${fadeIn * 0.78})`;
+        ctx.fill();
+        ctx.restore();
+
+        // Bintang kecil
+        ctx.save();
+        for (const [fx, fy] of STARS) {
+            // Bintang hanya di zona atas layar (langit)
+            const sy2 = fy * H * 0.90;
+            const starAlpha = fadeIn * (0.55 + Math.sin(fx * 37 + performance.now() * 0.0006) * 0.20);
+            ctx.beginPath();
+            ctx.arc(fx * W, sy2, 1.4, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255, 255, 255, ${starAlpha})`;
+            ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    // Overlay siklus hari — digambar di atas dunia, di bawah UI
+    function drawDayOverlay(W, H, timestamp) {
+        const { name, t } = getDayPhase(timestamp);
+        const NIGHT_ALPHA = 0.58; // gelap bulan — masih ada cahaya
+
+        let alpha;
+        if (name === 'siang') {
+            alpha = 0;
+        } else if (name === 'malam') {
+            alpha = NIGHT_ALPHA;
+        } else if (name === 'pagi') {
+            // Pagi: gelap perlahan memudar → terang (ease-out smooth)
+            const ease = 1 - Math.pow(1 - t, 2.2);
+            alpha = NIGHT_ALPHA * (1 - ease);
+        } else { // sore
+            // Sore: terang perlahan gelap (ease-in smooth)
+            const ease = Math.pow(t, 2.2);
+            alpha = NIGHT_ALPHA * ease;
+        }
+
+        if (alpha <= 0.005) return;
+
+        ctx.save();
+        // Warna lapisan malam: biru tua seperti langit berbulan
+        ctx.fillStyle = `rgba(8, 14, 42, ${alpha})`;
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+
+        // Bulan & bintang mulai muncul saat overlay cukup gelap
+        if (alpha > 0.14) {
+            drawMoonAndStars(W, H, alpha);
+        }
+    }
+
+    // Label waktu hari untuk ditampilkan di layar (opsional info)
+    const DAY_LABEL = { pagi: '🌅 Pagi', siang: '☀️ Siang', sore: '🌇 Sore', malam: '🌙 Malam' };
+
+    // Gambar label waktu di pojok kanan atas (kecil, transparan)
+    function drawDayClock(W, timestamp) {
+        if (dayStartTime === 0) return;
+        const { name } = getDayPhase(timestamp);
+        ctx.save();
+        ctx.font      = 'bold 11px sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillStyle = 'rgba(255,255,255,0.55)';
+        ctx.fillText(DAY_LABEL[name] || '', W - 10, 15);
+        ctx.restore();
+    }
+
+    // ─── SISTEM HUJAN ─────────────────────────────────────────────
+    // Hujan bisa terjadi di semua bioma kecuali gurun dan bersalju
+    // Durasi acak antara 1–4 menit, muncul sewaktu-waktu
+    const RAIN_EXCLUDED_BIOMES = ['gurun', 'bersalju'];
+    const RAIN_DROP_COUNT = 220;
+    const SNOW_DROP_COUNT = 180;
+    const RAIN_MAX_MS     = 4 * 60 * 1000; // 4 menit maks
+
+    const rainState = {
+        active:        false,
+        startTime:     0,
+        duration:      0,
+        nextCheckTime: 0,   // kapan periksa lagi apakah hujan mau mulai
+        drops:         [],
+    };
+
+    // Inisialisasi partikel hujan (koordinat fraksional 0–1)
+    function _initRainDrops() {
+        rainState.drops = [];
+        for (let i = 0; i < RAIN_DROP_COUNT; i++) {
+            rainState.drops.push({
+                fx:    Math.random(),
+                fy:    Math.random(),
+                speed: 0.008 + Math.random() * 0.006,
+                len:   0.012 + Math.random() * 0.018,
+                alpha: 0.25 + Math.random() * 0.45,
+            });
+        }
+    }
+    _initRainDrops();
+
+    // Inisialisasi partikel salju
+    const snowDrops = [];
+    function _initSnowDrops() {
+        snowDrops.length = 0;
+        for (let i = 0; i < SNOW_DROP_COUNT; i++) {
+            snowDrops.push({
+                fx:        Math.random(),
+                fy:        Math.random(),
+                speed:     0.0018 + Math.random() * 0.0022, // jauh lebih lambat dari hujan
+                size:      1.2 + Math.random() * 2.4,        // radius lingkaran kepingan salju
+                driftFreq: 0.4 + Math.random() * 1.2,        // frekuensi drift horizontal
+                driftAmp:  0.0004 + Math.random() * 0.0008,
+                alpha:     0.55 + Math.random() * 0.45,
+                phase:     Math.random() * Math.PI * 2,
+            });
+        }
+    }
+    _initSnowDrops();
+
+    function updateRain(timestamp) {
+        const biome   = getBiome(player.tileX, player.tileY);
+        const canRain = !RAIN_EXCLUDED_BIOMES.includes(biome);
+
+        if (rainState.active) {
+            // Hentikan HANYA jika durasi habis — tidak tergantung bioma saat ini
+            if ((timestamp - rainState.startTime) >= rainState.duration) {
+                rainState.active        = false;
+                rainState.nextCheckTime = timestamp + (20 + Math.random() * 30) * 1000;
+            }
+        } else {
+            // Cek apakah saatnya mulai hujan — hanya mulai di bioma yang bisa hujan
+            if (canRain && timestamp >= rainState.nextCheckTime) {
+                if (Math.random() < 0.35) {
+                    rainState.active    = true;
+                    rainState.startTime = timestamp;
+                    rainState.duration  = (60 + Math.random() * 180) * 1000;
+                    if (rainState.duration > RAIN_MAX_MS) rainState.duration = RAIN_MAX_MS;
+                }
+                rainState.nextCheckTime = timestamp + (30 + Math.random() * 50) * 1000;
+            }
+        }
+    }
+
+    // ─── GAMBAR HUJAN (bioma non-bersalju) ───────────────────────
+    function _drawRainDrops(W, H, rAlpha) {
+        ctx.save();
+        ctx.fillStyle = `rgba(15, 25, 50, ${0.28 * rAlpha})`;
+        ctx.fillRect(0, 0, W, H);
+
+        ctx.lineCap = 'round';
+        const angleRad = 0.12;
+        const sinA = Math.sin(angleRad);
+        const cosA = Math.cos(angleRad);
+
+        for (const drop of rainState.drops) {
+            drop.fy += drop.speed;
+            drop.fx -= drop.speed * sinA * 0.3;
+
+            if (drop.fy > 1 + drop.len) {
+                drop.fy = -drop.len - Math.random() * 0.05;
+                drop.fx = Math.random();
+            }
+            if (drop.fx < -0.02) drop.fx = 1.02;
+
+            const x1    = drop.fx * W;
+            const y1    = drop.fy * H;
+            const lenPx = drop.len * H;
+            const x2    = x1 - sinA * lenPx;
+            const y2    = y1 + cosA * lenPx;
+
+            ctx.beginPath();
+            ctx.moveTo(x1, y1);
+            ctx.lineTo(x2, y2);
+            ctx.strokeStyle = `rgba(170, 210, 255, ${drop.alpha * rAlpha})`;
+            ctx.lineWidth   = 0.8;
+            ctx.stroke();
+        }
+
+        // Kabut halus bawah layar
+        const mistGrad = ctx.createLinearGradient(0, H * 0.75, 0, H);
+        mistGrad.addColorStop(0, `rgba(100, 140, 200, 0)`);
+        mistGrad.addColorStop(1, `rgba(100, 140, 200, ${0.10 * rAlpha})`);
+        ctx.fillStyle = mistGrad;
+        ctx.fillRect(0, H * 0.75, W, H * 0.25);
+
+        ctx.restore();
+    }
+
+    // ─── GAMBAR SALJU (bioma bersalju saat hujan aktif) ──────────
+    function _drawSnowFlakes(W, H, rAlpha, timestamp) {
+        ctx.save();
+
+        // Overlay putih tipis — kesan langit salju
+        ctx.fillStyle = `rgba(210, 230, 255, ${0.15 * rAlpha})`;
+        ctx.fillRect(0, 0, W, H);
+
+        for (const flake of snowDrops) {
+            // Gerakan jatuh + drift sinusoidal pelan
+            flake.fy += flake.speed;
+            flake.fx += Math.sin(timestamp * 0.001 * flake.driftFreq + flake.phase) * flake.driftAmp;
+
+            if (flake.fy > 1.02) {
+                flake.fy = -0.02;
+                flake.fx = Math.random();
+            }
+            if (flake.fx < -0.02) flake.fx = 1.02;
+            if (flake.fx > 1.02) flake.fx = -0.02;
+
+            const sx = flake.fx * W;
+            const sy = flake.fy * H;
+
+            // Kepingan salju: lingkaran putih dengan bayangan lembut
+            ctx.beginPath();
+            ctx.arc(sx, sy, flake.size, 0, Math.PI * 2);
+            ctx.fillStyle   = `rgba(240, 250, 255, ${flake.alpha * rAlpha})`;
+            ctx.shadowBlur  = flake.size * 1.5;
+            ctx.shadowColor = `rgba(200, 230, 255, ${0.5 * rAlpha})`;
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        // Lapisan embun tipis di bawah layar
+        const snowMist = ctx.createLinearGradient(0, H * 0.80, 0, H);
+        snowMist.addColorStop(0, `rgba(220, 235, 255, 0)`);
+        snowMist.addColorStop(1, `rgba(220, 235, 255, ${0.12 * rAlpha})`);
+        ctx.fillStyle = snowMist;
+        ctx.fillRect(0, H * 0.80, W, H * 0.20);
+
+        ctx.restore();
+    }
+
+    // ─── GAMBAR OVERLAY CUACA (hujan atau salju, bergantung bioma) ─
+    function drawRainOverlay(W, H, timestamp) {
+        if (!rainState.active) return;
+
+        const elapsed  = timestamp - rainState.startTime;
+        const fadeTime = 4000;
+
+        let rAlpha = 1;
+        if (elapsed < fadeTime) {
+            rAlpha = elapsed / fadeTime;
+        } else if (elapsed > rainState.duration - fadeTime) {
+            rAlpha = Math.max(0, (rainState.duration - elapsed) / fadeTime);
+        }
+        rAlpha = Math.max(0, Math.min(1, rAlpha));
+        if (rAlpha <= 0.01) return;
+
+        const currentBiome = getBiome(player.tileX, player.tileY);
+
+        if (currentBiome === 'bersalju') {
+            // Di area bersalju: tampilkan salju, bukan hujan
+            _drawSnowFlakes(W, H, rAlpha, timestamp);
+        } else {
+            // Di area lain: tampilkan hujan biasa
+            _drawRainDrops(W, H, rAlpha);
+        }
+    }
+    async function unlockAudio() {
+        if (audioUnlocked) return;
+        audioUnlocked = true;
+        try { await getAudioCtx().resume(); } catch(e) {}
+        await preloadAudio();
+        // Mulai backsound menu setelah audio unlock
+        if (!gameStarted) startBacksound();
+    }
+    document.addEventListener('touchstart', unlockAudio, { once: true });
+    document.addEventListener('mousedown',  unlockAudio, { once: true });
+
+    // ─── OBJEK PLAYER ────────────────────────────────────────────
+    const player = {
+        tileX: 0,
+        tileY: 0,
+        renderX: 0,   // posisi render halus (float, diinterpolasi menuju tileX)
+        renderY: 0,   // posisi render halus (float, diinterpolasi menuju tileY)
+        size: 25,
+        color: '#ffffff',
+        radiusColor: 'rgba(255, 255, 255, 0.15)',
+        radiusRange: 80,
+        lives:          10,  // jumlah nyawa pemain
+        lastDamageTime: 0,   // cooldown agar tidak kena hit spam
+    };
+
+    // Cooldown kena damage dari mob (ms)
+    const PLAYER_DAMAGE_COOLDOWN = 2000;
+
+    // ─── MOBS AYAM ───────────────────────────────────────────────
+    const MOB_SIZE = 22;
+    const mobs = [];
+
+    function createMob(id) {
+        // Spawn acak di sekitar origin
+        const angle = Math.random() * Math.PI * 2;
+        const dist  = 3 + Math.floor(Math.random() * SPAWN_RADIUS);
+        const spawnTX = Math.round(Math.cos(angle) * dist);
+        const spawnTY = Math.round(Math.sin(angle) * dist);
+        return {
+            id,
+            tileX: spawnTX,
+            tileY: spawnTY,
+            renderX: spawnTX,  // posisi render halus (float)
+            renderY: spawnTY,  // posisi render halus (float)
+            lastMoveTime:  0,
+            lastVoiceTime: 0,
+            voiceInterval: 3000 + Math.random() * 5000, // 3–8 detik
+            // Arah gerak saat ini (ganti setiap beberapa langkah)
+            dirX: 0,
+            dirY: 0,
+            dirSteps:    0,
+            dirMaxSteps: 2 + Math.floor(Math.random() * 4),
+            // ─ Sistem HP & Lari Menghindar ─
+            hp:          3,       // 3 nyawa
+            lastHitTime: 0,       // cooldown agar tidak kena spam hit
+            fleeing:     false,   // sedang lari menghindar?
+            fleeUntil:   0,       // timestamp selesai menghindar
+        };
+    }
+
+    for (let i = 0; i < MOB_COUNT; i++) mobs.push(createMob(i));
+
+    // Update AI ayam — wandering random + lari menghindar saat kena pukul
+    function updateMobs(timestamp) {
+        for (const mob of mobs) {
+            // ─ Cek apakah masa menghindar sudah habis ─
+            if (mob.fleeing && timestamp >= mob.fleeUntil) {
+                mob.fleeing  = false;
+                mob.dirSteps = 0; // reset arah wandering
+            }
+
+            // ─ Gerakan ─
+            // Saat lari: gerakan lebih cepat tapi tidak terlalu drastis (~1.5× lebih sering)
+            const moveDelay = mob.fleeing ? MOB_MOVE_DELAY * 0.68 : MOB_MOVE_DELAY;
+            if (timestamp - mob.lastMoveTime >= moveDelay) {
+                mob.lastMoveTime = timestamp;
+
+                let didMove = false; // lacak apakah mob benar-benar bergerak
+
+                if (mob.fleeing) {
+                    // Lari menjauhi player (arah cardinal dominan)
+                    const ddx = mob.tileX - player.tileX;
+                    const ddy = mob.tileY - player.tileY;
+                    const len = Math.sqrt(ddx * ddx + ddy * ddy);
+                    if (len > 0) {
+                        if (Math.abs(ddx) >= Math.abs(ddy)) {
+                            mob.tileX += ddx > 0 ? 1 : -1;
+                        } else {
+                            mob.tileY += ddy > 0 ? 1 : -1;
+                        }
+                        didMove = true;
+                    } else {
+                        // Tepat di posisi player — lari arah acak
+                        const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+                        const pick = dirs[Math.floor(Math.random() * dirs.length)];
+                        mob.tileX += pick.x;
+                        mob.tileY += pick.y;
+                        didMove = true;
+                    }
+                } else {
+                    // Wandering normal
+                    if (mob.dirSteps <= 0) {
+                        const dirs = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1},{x:0,y:0}];
+                        const pick = dirs[Math.floor(Math.random() * dirs.length)];
+                        mob.dirX        = pick.x;
+                        mob.dirY        = pick.y;
+                        mob.dirSteps    = mob.dirMaxSteps;
+                        mob.dirMaxSteps = 2 + Math.floor(Math.random() * 4);
+                    }
+
+                    if (mob.dirX !== 0 || mob.dirY !== 0) {
+                        mob.tileX += mob.dirX;
+                        mob.tileY += mob.dirY;
+                        mob.dirSteps--;
+                        didMove = true;
+                    }
+                    // Jika dirX=0 dan dirY=0 → ayam diam, tidak mainkan jalan.mp3
+                }
+
+                // Suara langkah ayam 3D — hanya saat benar-benar bergerak
+                // Di hutan/hutan_tropis: pakai jalan hutan.mp3, gurun: jalan pasir.mp3
+                if (didMove) {
+                    const relX = mob.tileX - player.tileX;
+                    const relY = mob.tileY - player.tileY;
+                    const distTiles = Math.sqrt(relX * relX + relY * relY);
+                    // Hanya bunyikan langkah jika dalam radius pendengaran
+                    if (distTiles <= HEARING_RADIUS_TILES) {
+                        const mobBiome = getBiome(mob.tileX, mob.tileY);
+                        let stepSnd = 'jalan.mp3';
+                        if (mobBiome === 'hutan' || mobBiome === 'hutan_tropis') {
+                            stepSnd = 'jalan hutan.mp3';
+                        } else if (mobBiome === 'gurun') {
+                            stepSnd = 'jalan pasir.mp3';
+                        }
+                        play3D(stepSnd, relX, relY, mob.fleeing ? 1.0 : 0.75);
+                    }
+                }
+            }
+
+            // ─ Suara ayam acak (hanya saat tidak lari) ─
+            if (!mob.fleeing && timestamp - mob.lastVoiceTime >= mob.voiceInterval) {
+                mob.lastVoiceTime = timestamp;
+                mob.voiceInterval = 3000 + Math.random() * 5000;
+
+                const relX  = mob.tileX - player.tileX;
+                const relY  = mob.tileY - player.tileY;
+                const distTiles = Math.sqrt(relX * relX + relY * relY);
+                // Hanya bunyikan jika mob dalam radius pendengaran
+                if (distTiles <= HEARING_RADIUS_TILES) {
+                    const sound = Math.random() < 0.5 ? 'ayam 1.mp3' : 'ayam 2.mp3';
+                    play3D(sound, relX, relY, 1.0);
+                }
+            }
+        }
+    }
+
+    // Gambar semua ayam (gunakan renderX/Y agar gerakan mulus)
+    function drawMobs(originSX, originSY) {
+        for (const mob of mobs) {
+            const sx = originSX + mob.renderX * TILE_SIZE + TILE_SIZE / 2;
+            const sy = originSY + mob.renderY * TILE_SIZE + TILE_SIZE / 2;
+            ctx.save();
+
+            // Warna berubah saat lari menghindar
+            ctx.fillStyle   = mob.fleeing ? '#ff7a00' : '#f5c518';
+            ctx.shadowBlur  = 8;
+            ctx.shadowColor = mob.fleeing ? 'rgba(255,80,0,0.6)' : 'rgba(245,197,24,0.5)';
+            ctx.fillRect(sx - MOB_SIZE / 2, sy - MOB_SIZE / 2, MOB_SIZE, MOB_SIZE);
+            ctx.shadowBlur = 0;
+
+            // Border
+            ctx.strokeStyle = mob.fleeing ? '#cc3300' : '#e6a800';
+            ctx.lineWidth   = 1.5;
+            ctx.strokeRect(sx - MOB_SIZE / 2, sy - MOB_SIZE / 2, MOB_SIZE, MOB_SIZE);
+
+            // Indikator HP — titik merah di atas ayam
+            const dotR      = 3.5;
+            const dotGap    = 9;
+            const dotStartX = sx - ((mob.hp - 1) * dotGap) / 2;
+            const dotY      = sy - MOB_SIZE / 2 - 7;
+            for (let h = 0; h < mob.hp; h++) {
+                ctx.beginPath();
+                ctx.arc(dotStartX + h * dotGap, dotY, dotR, 0, Math.PI * 2);
+                ctx.fillStyle   = '#ff3b3b';
+                ctx.shadowBlur  = 5;
+                ctx.shadowColor = 'rgba(255,0,0,0.7)';
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            }
+
+            ctx.restore();
+        }
+    }
+
+    // ─── TANGAN (segitiga pointer) ────────────────────────────────
+    const hand = {
+        visible:  false,
+        angle:    0,
+        distance: 0,
+        originX:  0,
+        originY:  0,
+    };
+
+    // ─── JOYSTICK (layar bawah) ───────────────────────────────────
+    const joystick = {
+        visible: false,
+        baseX: 0, baseY: 0,
+        knobX: 0, knobY: 0,
+        maxR: JOYSTICK_R,
+    };
+
+    // ─── STATE ────────────────────────────────────────────────────
+    let lastMoveTime  = 0;
+    let lastTimestamp = 0;    // untuk hitung deltaTime antar frame
+    let topTouchId    = null;
+    let bottomTouchId = null;
+    let mouseZone     = null;
+    let lastWindTime  = 0;    // throttle suara angin
+    let lastRiverSoundTime = 0;  // throttle suara air sungai
+    const RIVER_HEAR_RADIUS    = 6;    // radius tile terdengar suara sungai
+    const RIVER_SOUND_INTERVAL = 900;  // ms antar pemutaran suara sungai
+
+    // ─── WEAPON STATE ─────────────────────────────────────────────
+    const weapon = {
+        mode:        'unarmed', // 'unarmed' | 'pistol'
+        ammo:        MAX_AMMO,
+        isReloading: false,
+        reloadUntil: 0,
+        reloadTimer: null,
+    };
+    let gunShotTime  = 0;
+    let gunShotAngle = 0;
+    let lastGunSoundTime      = 0;    // anti-overlap senjata 1.mp3
+    const GUN_SOUND_MIN_GAP   = 220;  // ms minimum jeda antar suara tembak
+    let weaponSwitchLockUntil = 0;  // kunci ganti senjata 5 detik
+    const WEAPON_SWITCH_LOCK = 5000; // ms
+
+    // ─── HOLD TIMER UNTUK GANTI SENJATA (zona atas, tahan 0.5 detik) ─
+    let holdWeaponTimer = null;
+
+    // ─── SWIPE TRACKER (zona atas) ────────────────────────────────
+    let topSwipeStartX = 0;
+    let topSwipeStartY = 0;
+
+    // ─── RESIZE ──────────────────────────────────────────────────
+    function resize() {
+        canvas.width  = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // ─── HELPER ZONA ─────────────────────────────────────────────
+    function isTopZone(y) { return y < canvas.height / 2; }
+
+    // ─── UPDATE TANGAN ───────────────────────────────────────────
+    function updateHand(touchX, touchY) {
+        const dx = touchX - hand.originX;
+        const dy = touchY - hand.originY;
+        hand.angle    = Math.atan2(dy, dx);
+        const t       = Math.min(Math.sqrt(dx*dx+dy*dy) / HAND_DRAG_MAX, 1);
+        hand.distance = t * (player.radiusRange * 0.88);
+
+        // Suara angin (ayunan tangan) HANYA saat mode unarmed — tidak untuk bidik pistol
+        if (weapon.mode === 'unarmed') {
+            const nowW = performance.now();
+            if (hand.distance > 4 && nowW - lastWindTime > 200) {
+                lastWindTime = nowW;
+                const wx = Math.cos(hand.angle) * (hand.distance / TILE_SIZE);
+                const wy = Math.sin(hand.angle) * (hand.distance / TILE_SIZE);
+                play3D('angin.mp3', wx, wy, 0.55);
+            }
+        }
+    }
+
+    // ─── UPDATE JOYSTICK ─────────────────────────────────────────
+    function updateJoystick(touchX, touchY) {
+        const dx   = touchX - joystick.baseX;
+        const dy   = touchY - joystick.baseY;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist > joystick.maxR) {
+            const r = joystick.maxR / dist;
+            joystick.knobX = joystick.baseX + dx * r;
+            joystick.knobY = joystick.baseY + dy * r;
+        } else {
+            joystick.knobX = touchX;
+            joystick.knobY = touchY;
+        }
+    }
+
+    // ─── AMBIL ARAH DARI JOYSTICK ────────────────────────────────
+    function getJoystickDir() {
+        if (!joystick.visible) return { dx: 0, dy: 0 };
+        const dx     = joystick.knobX - joystick.baseX;
+        const dy     = joystick.knobY - joystick.baseY;
+        const thresh = joystick.maxR * 0.22;
+        if (Math.abs(dx) >= Math.abs(dy)) {
+            return { dx: dx > thresh ? 1 : dx < -thresh ? -1 : 0, dy: 0 };
+        } else {
+            return { dx: 0, dy: dy > thresh ? 1 : dy < -thresh ? -1 : 0 };
+        }
+    }
+
+    // ─── TOUCH EVENTS ────────────────────────────────────────────
+    canvas.addEventListener('touchstart', e => {
+        e.preventDefault();
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        for (const t of e.changedTouches) {
+            const x = t.clientX, y = t.clientY;
+            if (isTopZone(y) && topTouchId === null) {
+                const now = performance.now();
+
+                // ─ Hold 0.5 detik untuk ganti senjata ─
+                holdWeaponTimer = setTimeout(() => {
+                    toggleWeapon(performance.now());
+                    holdWeaponTimer = null;
+                }, 500);
+
+                topTouchId     = t.identifier;
+                topSwipeStartX = x;
+                topSwipeStartY = y;
+
+                // Panah selalu aktif — tidak dikunci saat beralih senjata
+                hand.originX  = x;
+                hand.originY  = y;
+                hand.visible  = true;
+                hand.distance = 0;
+                updateHand(x, y);
+            } else if (!isTopZone(y) && bottomTouchId === null) {
+                bottomTouchId    = t.identifier;
+                joystick.baseX   = x;
+                joystick.baseY   = y;
+                joystick.knobX   = x;
+                joystick.knobY   = y;
+                joystick.visible = true;
+            }
+        }
+    }, { passive: false });
+
+    canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        for (const t of e.changedTouches) {
+            if (t.identifier === topTouchId)    updateHand(t.clientX, t.clientY);
+            if (t.identifier === bottomTouchId) updateJoystick(t.clientX, t.clientY);
+        }
+    }, { passive: false });
+
+    function handleTouchEnd(e) {
+        e.preventDefault();
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        for (const t of e.changedTouches) {
+            if (t.identifier === topTouchId) {
+                // ─ Batalkan timer ganti senjata jika jari diangkat sebelum 0.5 detik ─
+                if (holdWeaponTimer) {
+                    clearTimeout(holdWeaponTimer);
+                    holdWeaponTimer = null;
+                }
+                // ─ Deteksi swipe untuk tembakan pistol ─
+                if (weapon.mode === 'pistol' && hand.visible) {
+                    const sdx = t.clientX - topSwipeStartX;
+                    const sdy = t.clientY - topSwipeStartY;
+                    const swipeDist = Math.sqrt(sdx * sdx + sdy * sdy);
+                    if (swipeDist > SWIPE_THRESHOLD) {
+                        tryGunShoot();
+                    }
+                }
+                topTouchId   = null;
+                hand.visible = false;
+            }
+            if (t.identifier === bottomTouchId) {
+                bottomTouchId    = null;
+                joystick.visible = false;
+            }
+        }
+    }
+    canvas.addEventListener('touchend',    handleTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', handleTouchEnd, { passive: false });
+
+    // ─── MOUSE EVENTS (desktop testing) ─────────────────────────
+    canvas.addEventListener('mousedown', e => {
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        const x = e.clientX, y = e.clientY;
+        if (isTopZone(y)) {
+            const now = performance.now();
+            // Tahan 0.5 detik = ganti senjata (desktop testing)
+            holdWeaponTimer = setTimeout(() => {
+                toggleWeapon(performance.now());
+                holdWeaponTimer = null;
+            }, 500);
+
+            mouseZone      = 'top';
+            topSwipeStartX = x;
+            topSwipeStartY = y;
+
+            // Panah selalu aktif — tidak dikunci saat beralih senjata
+            hand.originX  = x;
+            hand.originY  = y;
+            hand.visible  = true;
+            hand.distance = 0;
+            updateHand(x, y);
+        } else {
+            mouseZone        = 'bottom';
+            joystick.baseX   = x;
+            joystick.baseY   = y;
+            joystick.knobX   = x;
+            joystick.knobY   = y;
+            joystick.visible = true;
+        }
+    });
+
+    canvas.addEventListener('mousemove', e => {
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        if (mouseZone === 'top')    updateHand(e.clientX, e.clientY);
+        if (mouseZone === 'bottom') updateJoystick(e.clientX, e.clientY);
+    });
+
+    canvas.addEventListener('mouseup', e => {
+        if (!gameStarted) return;  // blokir sebelum game mulai
+        // Batalkan timer ganti senjata
+        if (holdWeaponTimer) {
+            clearTimeout(holdWeaponTimer);
+            holdWeaponTimer = null;
+        }
+        if (mouseZone === 'top' && weapon.mode === 'pistol' && hand.visible) {
+            const sdx = e.clientX - topSwipeStartX;
+            const sdy = e.clientY - topSwipeStartY;
+            if (Math.sqrt(sdx * sdx + sdy * sdy) > SWIPE_THRESHOLD) {
+                tryGunShoot();
+            }
+        }
+        mouseZone        = null;
+        hand.visible     = false;
+        joystick.visible = false;
+    });
+
+    // ─── SUARA AIR SUNGAI 3D ──────────────────────────────────────
+    // Cari tile sungai terdekat, putar suara 3D dari arahnya
+    function updateRiverSound(timestamp) {
+        if (timestamp - lastRiverSoundTime < RIVER_SOUND_INTERVAL) return;
+
+        let closestDist = Infinity;
+        let closestRelX = 0;
+        let closestRelY = 0;
+        let found = false;
+
+        for (let dx = -RIVER_HEAR_RADIUS; dx <= RIVER_HEAR_RADIUS; dx++) {
+            for (let dy = -RIVER_HEAR_RADIUS; dy <= RIVER_HEAR_RADIUS; dy++) {
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > RIVER_HEAR_RADIUS) continue;
+                const tx = player.tileX + dx;
+                const ty = player.tileY + dy;
+                if (isRiverTile(tx, ty) && dist < closestDist) {
+                    closestDist = dist;
+                    closestRelX = dx;
+                    closestRelY = dy;
+                    found = true;
+                }
+            }
+        }
+
+        if (found) {
+            lastRiverSoundTime = timestamp;
+            // Volume semakin kecil seiring jarak; di atas tile sungai vol = 1.0
+            const vol = Math.max(0.12, 1.0 - (closestDist / RIVER_HEAR_RADIUS) * 0.75);
+            play3D('air sungai.mp3', closestRelX, closestRelY, vol);
+        }
+    }
+
+    // ─── CEK MOB MENGENAI PLAYER ─────────────────────────────────
+    // Jika mob berada di tile yang sama dengan player, kurangi 1 nyawa
+    function checkMobHitPlayer(timestamp) {
+        if (player.lives <= 0) return;
+        if (timestamp - player.lastDamageTime < PLAYER_DAMAGE_COOLDOWN) return;
+
+        for (const mob of mobs) {
+            if (mob.tileX === player.tileX && mob.tileY === player.tileY) {
+                player.lives--;
+                player.lastDamageTime = timestamp;
+                // Suara kena damage (di posisi player = dx=0, dy=0)
+                play3D('kena.mp3', 0, 0, 1.3);
+
+                if (player.lives <= 0) {
+                    // Sedikit delay agar suara sempat terdengar
+                    setTimeout(() => {
+                        alert('GAME OVER\n\nKamu kehabisan nyawa!\n\nTekan OK untuk memulai ulang.');
+                        location.reload();
+                    }, 350);
+                }
+                break; // hanya satu hit per cooldown
+            }
+        }
+    }
+
+    // ─── GAMBAR NYAWA PEMAIN ─────────────────────────────────────
+    function drawPlayerLives() {
+        ctx.save();
+        const lives    = player.lives;
+        const maxLives = 10;
+        const startX   = 14;
+        const startY   = 62;
+        const heartGap = 16;
+        const bgW      = maxLives * heartGap + 6;
+
+        // Latar transparan
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+        ctx.beginPath();
+        ctx.rect(startX - 4, startY - 13, bgW, 22);
+        ctx.fill();
+
+        // Gambar hati: merah = nyawa tersisa, putih redup = nyawa habis
+        ctx.font      = 'bold 13px sans-serif';
+        ctx.textAlign = 'left';
+        for (let i = 0; i < maxLives; i++) {
+            ctx.fillStyle = i < lives ? '#ff3333' : 'rgba(255,255,255,0.18)';
+            ctx.fillText('♥', startX + i * heartGap, startY);
+        }
+
+        // Teks jumlah nyawa di sebelah kanan
+        ctx.font      = 'bold 10px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = 'rgba(255,255,255,0.65)';
+        ctx.fillText(lives + '/' + maxLives, startX + maxLives * heartGap + 4, startY);
+
+        ctx.restore();
+    }
+
+    // ─── CEK TANGAN MENGENAI MOB ─────────────────────────────────
+    // HP berkurang 1 tiap pukul. Mati di hp=0. Masih hidup → lari 3 detik.
+    // Suara: kena.mp3 selalu berbunyi saat kena. menghindar.mp3 saat masih hidup.
+    // ayam mati.mp3 saat mati.
+    const HIT_COOLDOWN = 400; // ms — cegah hit ganda dari satu ayunan
+    function checkHandHit(pSX, pSY, originSX, originSY) {
+        if (weapon.mode === 'pistol') return; // pistol punya sistem tembak sendiri
+        if (!hand.visible || hand.distance < 4) return;
+        const tipSX = pSX + Math.cos(hand.angle) * hand.distance;
+        const tipSY = pSY + Math.sin(hand.angle) * hand.distance;
+        const HIT_R = MOB_SIZE * 1.1;
+        const now   = performance.now();
+
+        for (let i = mobs.length - 1; i >= 0; i--) {
+            const mob = mobs[i];
+            // Cooldown per-mob agar tidak kena spam dalam satu ayunan
+            if (now - mob.lastHitTime < HIT_COOLDOWN) continue;
+
+            const mobSX = originSX + mob.renderX * TILE_SIZE + TILE_SIZE / 2;
+            const mobSY = originSY + mob.renderY * TILE_SIZE + TILE_SIZE / 2;
+            const dist  = Math.sqrt((tipSX - mobSX) ** 2 + (tipSY - mobSY) ** 2);
+            if (dist < HIT_R) {
+                mob.lastHitTime = now;
+                mob.hp--;
+
+                const relX = mob.tileX - player.tileX;
+                const relY = mob.tileY - player.tileY;
+
+                // Suara kena selalu berbunyi saat ayam kena pukul
+                play3D('kena.mp3', relX, relY, 1.0);
+
+                if (mob.hp <= 0) {
+                    // Ayam mati — bunyikan ayam mati lalu hapus
+                    play3D('ayam mati.mp3', relX, relY, 1.0);
+                    mobs.splice(i, 1);
+                } else {
+                    // Ayam masih hidup — lari menghindar selama 3 detik
+                    mob.fleeing   = true;
+                    mob.fleeUntil = now + 3000;
+                    // Suara menghindar 3D sesuai posisi mob
+                    play3D('menghindar.mp3', relX, relY, 1.0);
+                }
+            }
+        }
+    }
+
+    // ─── SISTEM SENJATA (TOGGLE, RELOAD, TEMBAK) ─────────────────
+    function toggleWeapon(now) {
+        // Kunci ganti senjata 5 detik agar tidak spam
+        if (now < weaponSwitchLockUntil) return;
+        weaponSwitchLockUntil = now + WEAPON_SWITCH_LOCK;
+
+        if (weapon.mode === 'unarmed') {
+            weapon.mode = 'pistol';
+            startReload(now);
+        } else {
+            weapon.mode = 'unarmed';
+            weapon.isReloading = false;
+            if (weapon.reloadTimer) { clearTimeout(weapon.reloadTimer); weapon.reloadTimer = null; }
+        }
+    }
+
+    function startReload(now) {
+        weapon.isReloading = true;
+        weapon.reloadUntil = now + RELOAD_DURATION;
+        weapon.ammo        = 0;
+        if (weapon.reloadTimer) clearTimeout(weapon.reloadTimer);
+        play3D('reload senjata 1.mp3', 0, 0, 1.0);
+        weapon.reloadTimer = setTimeout(() => {
+            if (weapon.mode === 'pistol') {
+                weapon.isReloading = false;
+                weapon.ammo        = MAX_AMMO;
+            }
+            weapon.reloadTimer = null;
+        }, RELOAD_DURATION);
+    }
+
+    function tryGunShoot() {
+        if (weapon.isReloading || weapon.ammo <= 0) return;
+        const now = performance.now();
+
+        // Suara tembakan 3D — anti-overlap: cegah tabrakan saat swipe cepat
+        const gunSoundDist = 5;
+        const gdx = Math.cos(hand.angle) * gunSoundDist;
+        const gdy = Math.sin(hand.angle) * gunSoundDist;
+        if (now - lastGunSoundTime >= GUN_SOUND_MIN_GAP) {
+            play3D('senjata 1.mp3', gdx, gdy, 2.5);
+            lastGunSoundTime = now;
+        }
+
+        gunShotTime  = now;
+        gunShotAngle = hand.angle;
+
+        weapon.ammo--;
+
+        // Jeda 0.5 detik sebelum peluru mengenai target (lebih responsif)
+        const shotAngleAtFire = hand.angle;
+        setTimeout(() => {
+            checkGunHit(shotAngleAtFire);
+        }, 500);
+
+        // Auto-reload saat ammo habis
+        if (weapon.ammo <= 0) {
+            startReload(now);
+        }
+    }
+
+    function checkGunHit(shotAngle) {
+        const W       = canvas.width;
+        const H       = canvas.height;
+        const pSX     = W / 2;
+        const pSY     = H / 2;
+        const originSX = pSX - player.tileX * TILE_SIZE - TILE_SIZE / 2;
+        const originSY = pSY - player.tileY * TILE_SIZE - TILE_SIZE / 2;
+        const now      = performance.now(); // satu nilai konsisten untuk seluruh fungsi
+
+        for (let i = mobs.length - 1; i >= 0; i--) {
+            const mob   = mobs[i];
+            const mobSX = originSX + mob.tileX * TILE_SIZE + TILE_SIZE / 2;
+            const mobSY = originSY + mob.tileY * TILE_SIZE + TILE_SIZE / 2;
+
+            // Jarak mob dari pusat player
+            const distFromPlayer = Math.sqrt((mobSX - pSX) ** 2 + (mobSY - pSY) ** 2);
+            if (distFromPlayer > GUN_RADIUS_RANGE) continue;
+
+            // Cek sudut tembakan (cone ±30°)
+            const mobAngle = Math.atan2(mobSY - pSY, mobSX - pSX);
+            let angleDiff  = Math.abs(mobAngle - shotAngle);
+            if (angleDiff > Math.PI) angleDiff = Math.PI * 2 - angleDiff;
+            if (angleDiff > 0.52) continue;
+
+            // Kena! -3 HP
+            const relX = mob.tileX - player.tileX;
+            const relY = mob.tileY - player.tileY;
+            play3D('kena.mp3', relX, relY, 1.0);
+            mob.lastHitTime = now;
+            mob.hp -= 3;
+
+            if (mob.hp <= 0) {
+                play3D('ayam mati.mp3', relX, relY, 1.0);
+                mobs.splice(i, 1);
+            } else {
+                mob.fleeing   = true;
+                mob.fleeUntil = now + 3000;
+                play3D('menghindar.mp3', relX, relY, 1.0);
+            }
+        }
+    }
+
+    // ─── SISTEM BIOMA (9 bioma, sektor arah + jarak) ──────────────
+    //
+    // Peta dibagi 6 sektor sudut (masing-masing 60°) mulai dari timur, searah jarum jam:
+    //   Sektor 0  [0–60°]   → Padang Rumput
+    //   Sektor 1  [60–120°] → Rawa
+    //   Sektor 2  [120–180°]→ Hutan Tropis
+    //   Sektor 3  [180–240°]→ Savana
+    //   Sektor 4  [240–300°]→ Gurun
+    //   Sektor 5  [300–360°]→ Bersalju
+    //
+    // Lapisan jarak dari pusat (tile):
+    //   0–20   : Hutan (area spawn)
+    //   20–40  : Transisi → bioma sektor
+    //   40–170 : Bioma sektor penuh
+    //   170–200: Pantai (tepian)
+    //   > 200  : Laut (tak terbatas)
+
+    const BIOME_SECTORS = [
+        'padang_rumput',  // 0
+        'rawa',           // 1
+        'hutan_tropis',   // 2
+        'savana',         // 3
+        'gurun',          // 4
+        'bersalju',       // 5
+    ];
+
+    function getBiome(tx, ty) {
+        const dist = Math.sqrt(tx * tx + ty * ty);
+
+        if (dist < 20)  return 'hutan';
+        if (dist > 200) return 'laut';
+        if (dist > 170) return 'pantai';
+
+        // Sudut 0..2π (timur = 0, searah jarum jam)
+        const a      = (Math.atan2(ty, tx) + Math.PI * 2) % (Math.PI * 2);
+        const sector = Math.floor(a / (Math.PI / 3)) % 6;
+        const base   = BIOME_SECTORS[sector];
+
+        // Zona transisi 20–40: campuran antara hutan dan bioma sektor
+        if (dist < 40) return (dist < 30) ? 'hutan' : base;
+
+        return base;
+    }
+
+    // Warna tile per bioma (dua variasi checker)
+    const BIOME_COLORS = {
+        hutan:         ['#4ed164', '#48c95e'],
+        padang_rumput: ['#8dc44e', '#7db843'],
+        savana:        ['#c9a83c', '#b89530'],
+        hutan_tropis:  ['#1e8040', '#176632'],
+        rawa:          ['#546b3c', '#4a5f34'],
+        gurun:         ['#e8c870', '#d8b555'],
+        bersalju:      ['#ddeeff', '#c8dcf0'],
+        pantai:        ['#d4b483', '#c9a870'],
+        laut:          ['#1e6db5', '#1a5c9e'],
+    };
+
+    function getTileColor(tx, ty) {
+        if (tx === 0 && ty === 0) return '#3ec455';
+        const biome  = getBiome(tx, ty);
+        const even   = (tx + ty) % 2 === 0;
+        const colors = BIOME_COLORS[biome] || BIOME_COLORS.hutan;
+        return colors[even ? 0 : 1];
+    }
+
+    // Label tampilan bioma (untuk minimap & UI)
+    const BIOME_LABEL = {
+        hutan:         '🌲 Hutan',
+        padang_rumput: '🌾 Padang Rumput',
+        savana:        '🦁 Savana',
+        hutan_tropis:  '🌴 Hutan Tropis',
+        rawa:          '🐸 Rawa',
+        gurun:         '🏜 Gurun',
+        bersalju:      '❄️ Bersalju',
+        pantai:        '🏖 Pantai',
+        laut:          '🌊 Laut',
+    };
+
+    // Warna solid bioma untuk minimap
+    const BIOME_MM_COLOR = {
+        hutan:         '#3ab84e',
+        padang_rumput: '#7db843',
+        savana:        '#b89530',
+        hutan_tropis:  '#176632',
+        rawa:          '#4a5f34',
+        gurun:         '#d8b555',
+        bersalju:      '#c8dcf0',
+        pantai:        '#c9a870',
+        laut:          '#1a5c9e',
+    };
+
+    // ─── GAMBAR GRID TANAH ───────────────────────────────────────
+    function drawGrid(originSX, originSY, W, H) {
+        const startTX = Math.floor(-originSX / TILE_SIZE) - 1;
+        const endTX   = Math.ceil((W - originSX) / TILE_SIZE) + 1;
+        const startTY = Math.floor(-originSY / TILE_SIZE) - 1;
+        const endTY   = Math.ceil((H - originSY) / TILE_SIZE) + 1;
+
+        for (let tx = startTX; tx <= endTX; tx++) {
+            for (let ty = startTY; ty <= endTY; ty++) {
+                const x = originSX + tx * TILE_SIZE;
+                const y = originSY + ty * TILE_SIZE;
+                ctx.fillStyle = getTileColor(tx, ty);
+                ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+            }
+        }
+
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.18)';
+        ctx.lineWidth   = 0.8;
+        ctx.beginPath();
+        for (let tx = startTX; tx <= endTX + 1; tx++) {
+            const x = originSX + tx * TILE_SIZE;
+            ctx.moveTo(x, 0); ctx.lineTo(x, H);
+        }
+        for (let ty = startTY; ty <= endTY + 1; ty++) {
+            const y = originSY + ty * TILE_SIZE;
+            ctx.moveTo(0, y); ctx.lineTo(W, y);
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // ─── HASH DETERMINISTIK PER TILE (untuk dekorasi stabil) ────
+    function tileRand(tx, ty, seed) {
+        let h = (((tx * 1664525) ^ (ty * 1013904223)) + seed * 374761393) | 0;
+        h = (h ^ (h >>> 16)) | 0;
+        h = Math.imul(h, 0x45d9f3b) | 0;
+        return ((h ^ (h >>> 16)) >>> 0) / 0x100000000;
+    }
+
+    // ─── CEK TILE SUNGAI ──────────────────────────────────────────
+    // Sungai muncul di bioma rawa, hutan, dan hutan_tropis
+    function isRiverTile(tx, ty) {
+        const biome = getBiome(tx, ty);
+        if (biome !== 'rawa' && biome !== 'hutan' && biome !== 'hutan_tropis') return false;
+        const dist = Math.sqrt(tx * tx + ty * ty);
+        if (dist < 18 || dist > 160) return false;
+        // Arah tegak lurus terhadap arah radial (aliran sungai)
+        const angle   = Math.atan2(ty, tx);
+        const perpX   = -Math.sin(angle);
+        const perpY   =  Math.cos(angle);
+        const perpPos = tx * perpX + ty * perpY;
+        // Sungai berliku menggunakan fungsi sinus
+        const riverCenter = Math.sin(dist * 0.22 + angle * 1.3) * 3.0;
+        return Math.abs(perpPos - riverCenter) < 0.9;
+    }
+
+    // Warna mahkota pohon per bioma
+    const TREE_CROWN_COLOR = {
+        hutan:         '#1a6e2a',
+        padang_rumput: '#2a8020',
+        savana:        '#6b7a18',
+        hutan_tropis:  '#0a5c18',
+        rawa:          '#2e5a25',
+        bersalju:      '#4a7a50',
+        pantai:        '#3a8030',
+    };
+
+    const FLOWER_COLORS = ['#ff6eb4','#ffee55','#ff4040','#ffffff','#cc88ff','#ff8833','#44ddff','#88ff66'];
+
+    // ─── GAMBAR DEKORASI DUNIA (bunga, pohon, kaktus, batu, sungai) ──
+    function drawDecorations(originSX, originSY, W, H) {
+        const startTX = Math.floor(-originSX / TILE_SIZE) - 1;
+        const endTX   = Math.ceil((W - originSX) / TILE_SIZE) + 1;
+        const startTY = Math.floor(-originSY / TILE_SIZE) - 1;
+        const endTY   = Math.ceil((H - originSY) / TILE_SIZE) + 1;
+
+        ctx.save();
+        for (let tx = startTX; tx <= endTX; tx++) {
+            for (let ty = startTY; ty <= endTY; ty++) {
+                // Lewati tile player agar tidak tertutup dekorasi
+                if (tx === player.tileX && ty === player.tileY) continue;
+
+                const biome = getBiome(tx, ty);
+                if (biome === 'laut') continue;
+
+                const sx  = originSX + tx * TILE_SIZE;
+                const sy  = originSY + ty * TILE_SIZE;
+                const tcx = sx + TILE_SIZE / 2;
+                const tcy = sy + TILE_SIZE / 2;
+
+                // ── Sungai (overlay biru berlapis) ──
+                if (isRiverTile(tx, ty)) {
+                    ctx.fillStyle = 'rgba(30, 100, 200, 0.50)';
+                    ctx.fillRect(sx, sy, TILE_SIZE, TILE_SIZE);
+                    // Kilap permukaan air
+                    ctx.fillStyle = 'rgba(140, 210, 255, 0.25)';
+                    ctx.fillRect(sx + 5, sy + 5, TILE_SIZE - 10, 4);
+                    continue;
+                }
+
+                const r1 = tileRand(tx, ty, 1);
+                const r2 = tileRand(tx, ty, 2);
+                const r3 = tileRand(tx, ty, 3);
+                const r4 = tileRand(tx, ty, 4);
+
+                // Offset acak dalam tile agar tidak selalu di tengah
+                const ox = (r2 - 0.5) * (TILE_SIZE * 0.44);
+                const oy = (r3 - 0.5) * (TILE_SIZE * 0.44);
+
+                // ── Kaktus (hanya gurun) ──
+                if (biome === 'gurun') {
+                    if (r1 < 0.16) {
+                        const cx2 = tcx + ox;
+                        const cy2 = tcy + oy;
+                        ctx.fillStyle = '#1a5c1a';
+                        // Batang utama
+                        ctx.fillRect(cx2 - 3, cy2 - 7, 6, 14);
+                        // Tanduk kiri
+                        ctx.fillRect(cx2 - 8, cy2 - 2, 5, 4);
+                        // Tanduk kanan
+                        ctx.fillRect(cx2 + 3, cy2 - 2, 5, 4);
+                    }
+                    continue;
+                }
+
+                // ── Pohon kotak (semua bioma kecuali gurun) ──
+                if (r1 < 0.13) {
+                    const crown = TREE_CROWN_COLOR[biome] || '#2a8020';
+                    const tw = 22 + r4 * 14;   // lebar mahkota 22–36 px
+                    const th = 24 + r4 * 16;   // tinggi mahkota 24–40 px
+                    const px2 = tcx + ox;
+                    const py2 = tcy + oy;
+                    ctx.shadowBlur  = 6;
+                    ctx.shadowColor = 'rgba(0,0,0,0.35)';
+                    ctx.fillStyle   = crown;
+                    ctx.fillRect(px2 - tw / 2, py2 - th / 2, tw, th);
+                    ctx.shadowBlur  = 0;
+                    // Batang pohon (coklat kecil di bawah mahkota)
+                    ctx.fillStyle = '#5a3a18';
+                    ctx.fillRect(px2 - 3.5, py2 + th / 2 - 2, 7, 9);
+                    continue;
+                }
+
+                // ── Bebatuan kecil (rawa, hutan, hutan_tropis) ──
+                if (r1 >= 0.13 && r1 < 0.26 &&
+                    (biome === 'rawa' || biome === 'hutan' || biome === 'hutan_tropis')) {
+                    const rw = 7 + r4 * 6;
+                    const rh = 5 + r4 * 4;
+                    ctx.fillStyle   = 'rgba(120, 110, 95, 0.90)';
+                    ctx.fillRect(tcx - rw / 2 + ox, tcy - rh / 2 + oy, rw, rh);
+                    ctx.strokeStyle = 'rgba(65, 55, 42, 0.65)';
+                    ctx.lineWidth   = 0.8;
+                    ctx.strokeRect(tcx - rw / 2 + ox, tcy - rh / 2 + oy, rw, rh);
+                    // Highlight kecil di sudut batu
+                    ctx.fillStyle = 'rgba(180,170,155,0.40)';
+                    ctx.fillRect(tcx - rw / 2 + ox + 1, tcy - rh / 2 + oy + 1, rw * 0.4, 2);
+                    continue;
+                }
+
+                // ── Bunga warna-warni (hanya padang_rumput) ──
+                if (biome === 'padang_rumput' && r1 >= 0.13 && r1 < 0.44) {
+                    const ci  = Math.floor(r2 * FLOWER_COLORS.length);
+                    const fx  = tcx + ox;
+                    const fy  = tcy + oy;
+                    ctx.fillStyle = FLOWER_COLORS[ci];
+                    ctx.fillRect(fx - 3, fy - 3, 6, 6);
+                    // Titik putih tengah bunga
+                    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+                    ctx.fillRect(fx - 1, fy - 1, 2, 2);
+                }
+            }
+        }
+        ctx.restore();
+    }
+
+    // ─── GAMBAR RADIUS ───────────────────────────────────────────
+    function drawRadius(pSX, pSY, radius, fillColor, strokeColor) {
+        const r  = radius     || player.radiusRange;
+        const fc = fillColor  || player.radiusColor;
+        const sc = strokeColor|| 'rgba(255, 255, 255, 0.28)';
+        ctx.beginPath();
+        ctx.arc(pSX, pSY, r, 0, Math.PI * 2);
+        ctx.fillStyle   = fc;
+        ctx.fill();
+        ctx.strokeStyle = sc;
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+    }
+
+    // ─── GAMBAR TANGAN (segitiga) ─────────────────────────────────
+    function drawHand(pSX, pSY) {
+        if (!hand.visible || hand.distance < 1) return;
+        const hx   = pSX + Math.cos(hand.angle) * hand.distance;
+        const hy   = pSY + Math.sin(hand.angle) * hand.distance;
+        const triH = player.radiusRange * 0.25;
+        const triW = triH * 0.72;
+
+        ctx.save();
+        ctx.translate(hx, hy);
+        ctx.rotate(hand.angle + Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(0,    -triH * 0.65);
+        ctx.lineTo(-triW,  triH * 0.45);
+        ctx.lineTo( triW,  triH * 0.45);
+        ctx.closePath();
+        ctx.fillStyle   = '#ffffff';
+        ctx.shadowBlur  = 12;
+        ctx.shadowColor = 'rgba(255, 255, 255, 0.55)';
+        ctx.fill();
+        ctx.shadowBlur  = 0;
+        ctx.restore();
+    }
+
+    // ─── GAMBAR KARAKTER (kotak putih) ───────────────────────────
+    function drawPlayer(pSX, pSY) {
+        ctx.save();
+
+        // ── Lingkaran radius pendengaran (besar, di bawah kotak player) ──
+        const hearingPx = HEARING_RADIUS_TILES * TILE_SIZE;
+        ctx.beginPath();
+        ctx.arc(pSX, pSY, hearingPx, 0, Math.PI * 2);
+        ctx.fillStyle   = 'rgba(100, 200, 255, 0.04)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(100, 200, 255, 0.30)';
+        ctx.lineWidth   = 1.8;
+        ctx.setLineDash([8, 10]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Kotak putih player
+        ctx.shadowBlur  = 10;
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.3)';
+        ctx.fillStyle   = player.color;
+        ctx.fillRect(pSX - player.size/2, pSY - player.size/2, player.size, player.size);
+        ctx.shadowBlur = 0;
+
+        ctx.restore();
+    }
+
+    // ─── GAMBAR JOYSTICK ─────────────────────────────────────────
+    function drawJoystick() {
+        if (!joystick.visible) return;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(joystick.baseX, joystick.baseY, joystick.maxR, 0, Math.PI * 2);
+        ctx.fillStyle   = 'rgba(255, 255, 255, 0.07)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.32)';
+        ctx.lineWidth   = 2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(joystick.baseX, joystick.baseY, 5, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.22)';
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(joystick.knobX, joystick.knobY, joystick.maxR * 0.44, 0, Math.PI * 2);
+        ctx.fillStyle   = 'rgba(255, 255, 255, 0.52)';
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.lineWidth   = 1.5;
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // ─── GAMBAR GARIS PEMISAH LAYAR ──────────────────────────────
+    function drawDivider(W, H) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+        ctx.lineWidth   = 1;
+        ctx.setLineDash([5, 12]);
+        ctx.beginPath();
+        ctx.moveTo(0, H/2); ctx.lineTo(W, H/2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.restore();
+    }
+
+    // ─── GAMBAR EFEK GARIS KEKER (laser tembakan) ────────────────
+    function drawGunEffects(pSX, pSY, timestamp) {
+        if (weapon.mode !== 'pistol') return;
+        const elapsed = timestamp - gunShotTime;
+        if (elapsed > GUN_SHOT_DURATION || gunShotTime === 0) return;
+
+        const alpha = 1 - elapsed / GUN_SHOT_DURATION;
+        const endX  = pSX + Math.cos(gunShotAngle) * GUN_RADIUS_RANGE;
+        const endY  = pSY + Math.sin(gunShotAngle) * GUN_RADIUS_RANGE;
+
+        ctx.save();
+        // Garis utama laser
+        ctx.beginPath();
+        ctx.moveTo(pSX, pSY);
+        ctx.lineTo(endX, endY);
+        ctx.strokeStyle = `rgba(255, 80, 30, ${alpha * 0.95})`;
+        ctx.lineWidth   = 2.5;
+        ctx.shadowBlur  = 14;
+        ctx.shadowColor = `rgba(255, 100, 20, ${alpha})`;
+        ctx.stroke();
+
+        // Garis cahaya tipis di atas
+        ctx.beginPath();
+        ctx.moveTo(pSX, pSY);
+        ctx.lineTo(endX, endY);
+        ctx.strokeStyle = `rgba(255, 230, 180, ${alpha * 0.6})`;
+        ctx.lineWidth   = 1;
+        ctx.shadowBlur  = 0;
+        ctx.stroke();
+
+        // Titik muzzle flash di ujung
+        ctx.beginPath();
+        ctx.arc(endX, endY, 6 * alpha, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(255, 180, 80, ${alpha * 0.8})`;
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // ─── GAMBAR SLOT SENJATA (layar atas tengah) ─────────────────
+    function drawWeaponSlots(W, timestamp) {
+        const slots = [
+            { id: 'unarmed', label: '✊', name: 'TANGAN' },
+            { id: 'pistol',  label: '🔫', name: 'PISTOL'  },
+        ];
+
+        const slotW  = 54;
+        const slotH  = 48;
+        const gap    = 8;
+        const total  = slots.length * slotW + (slots.length - 1) * gap;
+        const startX = W / 2 - total / 2;
+        const startY = 10;
+
+        // Hitung apakah sedang dalam cooldown switch
+        const now      = performance.now();
+        const locked   = now < weaponSwitchLockUntil;
+        const lockFrac = locked ? (weaponSwitchLockUntil - now) / WEAPON_SWITCH_LOCK : 0;
+
+        ctx.save();
+        for (let i = 0; i < slots.length; i++) {
+            const sl   = slots[i];
+            const bx   = startX + i * (slotW + gap);
+            const by   = startY;
+            const active = weapon.mode === sl.id;
+
+            // Latar slot
+            ctx.beginPath();
+            ctx.rect(bx, by, slotW, slotH);
+            ctx.fillStyle = active
+                ? 'rgba(255, 255, 255, 0.18)'
+                : 'rgba(0, 0, 0, 0.50)';
+            ctx.fill();
+
+            // Border — aktif: putih terang, tidak aktif: redup
+            ctx.strokeStyle = active
+                ? 'rgba(255, 255, 255, 0.80)'
+                : 'rgba(255, 255, 255, 0.22)';
+            ctx.lineWidth = active ? 1.8 : 1;
+            ctx.stroke();
+
+            // Nomor slot (pojok kiri atas)
+            ctx.font      = 'bold 9px monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = 'rgba(255,255,255,0.45)';
+            ctx.fillText((i + 1).toString(), bx + 4, by + 11);
+
+            // Emoji ikon
+            ctx.font      = '20px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(sl.label, bx + slotW / 2, by + 31);
+
+            // Nama senjata
+            ctx.font      = 'bold 8px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = active ? '#ffffff' : 'rgba(255,255,255,0.40)';
+            ctx.fillText(sl.name, bx + slotW / 2, by + slotH - 5);
+
+            // Indikator aktif — garis bawah menyala
+            if (active) {
+                ctx.beginPath();
+                ctx.rect(bx + 4, by + slotH - 3, slotW - 8, 2.5);
+                ctx.fillStyle = weapon.mode === 'pistol'
+                    ? 'rgba(255, 80, 50, 0.90)'
+                    : 'rgba(100, 220, 120, 0.90)';
+                ctx.fill();
+            }
+        }
+
+        // Bar cooldown ganti senjata (muncul saat kunci aktif)
+        if (locked) {
+            const barW = total;
+            const barH = 4;
+            const barX = startX;
+            const barY = startY + slotH + 5;
+
+            ctx.beginPath();
+            ctx.rect(barX, barY, barW, barH);
+            ctx.fillStyle = 'rgba(255,255,255,0.12)';
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.rect(barX, barY, barW * lockFrac, barH);
+            ctx.fillStyle = 'rgba(255, 200, 50, 0.80)';
+            ctx.fill();
+
+            ctx.font      = '8px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillStyle = 'rgba(255, 200, 50, 0.85)';
+            ctx.fillText('KUNCI ' + Math.ceil((weaponSwitchLockUntil - now) / 1000) + 's', W / 2, barY + barH + 9);
+        }
+
+        ctx.restore();
+    }
+
+    // ─── GAMBAR UI SENJATA (ammo + status) ───────────────────────
+    function drawWeaponUI(W, timestamp) {
+        if (weapon.mode === 'unarmed') return;
+        ctx.save();
+
+        const bx = W - 125, by = 78, bw = 115, bh = 52;  // turun dari 10 → 78 agar tidak tabrakan slot
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.strokeStyle = weapon.isReloading ? 'rgba(255,150,0,0.7)' : 'rgba(255,60,60,0.7)';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.rect(bx, by, bw, bh);
+        ctx.fill();
+        ctx.stroke();
+
+        // Label senjata
+        ctx.font      = 'bold 11px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = weapon.isReloading ? '#ffaa00' : '#ff5555';
+        ctx.fillText(weapon.isReloading ? 'RELOAD...' : 'PISTOL', bx + 8, by + 19);
+
+        // Indikator peluru
+        const dotR   = 6;
+        const dotGap = 18;
+        const dotY   = by + 38;
+        const startX = bx + 12;
+        for (let i = 0; i < MAX_AMMO; i++) {
+            const cx2 = startX + i * dotGap + dotR;
+            ctx.beginPath();
+            ctx.arc(cx2, dotY, dotR, 0, Math.PI * 2);
+            if (i < weapon.ammo) {
+                ctx.fillStyle  = '#ff5555';
+                ctx.shadowBlur  = 6;
+                ctx.shadowColor = 'rgba(255,60,60,0.8)';
+            } else {
+                ctx.fillStyle  = 'rgba(255,255,255,0.15)';
+                ctx.shadowBlur  = 0;
+            }
+            ctx.fill();
+            ctx.shadowBlur = 0;
+        }
+
+        ctx.restore();
+    }
+
+    // ─── MINIMAP ─────────────────────────────────────────────────
+    const mmCanvas = document.getElementById('minimap-canvas');
+    const mmCtx    = mmCanvas.getContext('2d');
+    const MM_SIZE  = 130;   // px ukuran minimap (sedikit diperbesar)
+    const MM_RANGE = 110;   // tile radius tampil di minimap (agar seluruh peta terlihat)
+
+    // Set ukuran canvas minimap via JS agar konsisten
+    mmCanvas.width  = MM_SIZE;
+    mmCanvas.height = MM_SIZE;
+
+    function drawMinimap() {
+        if (!gameStarted) return;
+
+        const scale = MM_SIZE / (MM_RANGE * 2);  // px per tile
+        const cx    = MM_SIZE / 2;
+        const cy    = MM_SIZE / 2;
+
+        mmCtx.clearRect(0, 0, MM_SIZE, MM_SIZE);
+
+        // ── Gambar laut sebagai latar penuh ──
+        mmCtx.fillStyle = BIOME_MM_COLOR.laut;
+        mmCtx.fillRect(0, 0, MM_SIZE, MM_SIZE);
+
+        // ── Gambar bioma sebagai pie-slice + ring distance ──
+        // Urutan: dari luar ke dalam agar yang dekat tampil di atas
+
+        // Pantai (dist 170-200 tile) — cincin pasir di luar
+        const pantaiOuter = Math.min(200 * scale, cx);
+        const pantaiInner = Math.min(170 * scale, cx);
+        mmCtx.fillStyle = BIOME_MM_COLOR.pantai;
+        mmCtx.beginPath();
+        mmCtx.arc(cx, cy, pantaiOuter, 0, Math.PI * 2);
+        mmCtx.fill();
+
+        // Enam sektor bioma (dist 20–170 tile)
+        const sectorAngle = (Math.PI * 2) / 6;
+        const outerR      = Math.min(pantaiInner, cx);
+        for (let s = 0; s < 6; s++) {
+            const startA = s * sectorAngle;
+            const endA   = startA + sectorAngle;
+            mmCtx.fillStyle = BIOME_MM_COLOR[BIOME_SECTORS[s]];
+            mmCtx.beginPath();
+            mmCtx.moveTo(cx, cy);
+            mmCtx.arc(cx, cy, outerR, startA, endA);
+            mmCtx.closePath();
+            mmCtx.fill();
+        }
+
+        // Transisi hutan (ring dist 20–40)
+        const transR = Math.min(40 * scale, cx);
+        for (let s = 0; s < 6; s++) {
+            const startA = s * sectorAngle;
+            const endA   = startA + sectorAngle;
+            // Gradasi: gambar hutan tipis menutup sebagian transisi
+            mmCtx.globalAlpha = 0.55;
+            mmCtx.fillStyle   = BIOME_MM_COLOR.hutan;
+            mmCtx.beginPath();
+            mmCtx.moveTo(cx, cy);
+            mmCtx.arc(cx, cy, transR, startA, endA);
+            mmCtx.closePath();
+            mmCtx.fill();
+        }
+        mmCtx.globalAlpha = 1;
+
+        // Hutan inti (dist < 20)
+        const hutanR = Math.min(20 * scale, cx);
+        mmCtx.fillStyle = BIOME_MM_COLOR.hutan;
+        mmCtx.beginPath();
+        mmCtx.arc(cx, cy, hutanR, 0, Math.PI * 2);
+        mmCtx.fill();
+
+        // ── Garis batas antar sektor (tipis, semi-transparan) ──
+        mmCtx.save();
+        mmCtx.strokeStyle = 'rgba(0,0,0,0.18)';
+        mmCtx.lineWidth   = 0.7;
+        for (let s = 0; s < 6; s++) {
+            const a = s * sectorAngle;
+            mmCtx.beginPath();
+            mmCtx.moveTo(cx, cy);
+            mmCtx.lineTo(cx + Math.cos(a) * outerR, cy + Math.sin(a) * outerR);
+            mmCtx.stroke();
+        }
+        mmCtx.restore();
+
+        // ── Titik origin ──
+        mmCtx.beginPath();
+        mmCtx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+        mmCtx.fillStyle = '#ffffff';
+        mmCtx.fill();
+
+        // ── Posisi player (relatif ke tengah minimap, karena kamera ikut player) ──
+        // Di minimap yang player-centered, player selalu di tengah
+        // Tapi kita tampilkan posisi tile player terhadap origin world
+        const pMX = cx + player.tileX * scale;
+        const pMY = cy + player.tileY * scale;
+        const pMXc = Math.max(4, Math.min(MM_SIZE - 4, pMX));
+        const pMYc = Math.max(4, Math.min(MM_SIZE - 4, pMY));
+
+        // ── Mobs (relatif ke origin peta, bukan player) ──
+        for (const mob of mobs) {
+            const mx = cx + mob.tileX * scale;
+            const my = cy + mob.tileY * scale;
+            if (mx < 1 || mx > MM_SIZE - 1 || my < 1 || my > MM_SIZE - 1) continue;
+            mmCtx.beginPath();
+            mmCtx.arc(mx, my, 2.5, 0, Math.PI * 2);
+            mmCtx.fillStyle = mob.fleeing ? '#ff7a00' : '#f5c518';
+            mmCtx.fill();
+        }
+
+        // ── Titik player (putih, bercahaya) ──
+        mmCtx.beginPath();
+        mmCtx.arc(pMXc, pMYc, 4, 0, Math.PI * 2);
+        mmCtx.fillStyle = '#ffffff';
+        mmCtx.shadowBlur  = 7;
+        mmCtx.shadowColor = 'rgba(255,255,255,0.9)';
+        mmCtx.fill();
+        mmCtx.shadowBlur = 0;
+
+        // ── Label bioma posisi player ──
+        const playerBiome = getBiome(player.tileX, player.tileY);
+        const biomeLabel  = BIOME_LABEL[playerBiome] || '❓';
+        mmCtx.font      = 'bold 8px sans-serif';
+        mmCtx.textAlign = 'center';
+        mmCtx.fillStyle = 'rgba(0,0,0,0.55)';
+        mmCtx.fillText(biomeLabel, MM_SIZE / 2 + 1, MM_SIZE - 4);
+        mmCtx.fillStyle = 'rgba(255,255,255,0.95)';
+        mmCtx.fillText(biomeLabel, MM_SIZE / 2, MM_SIZE - 5);
+
+        // ── Border minimap ──
+        mmCtx.strokeStyle = 'rgba(255,255,255,0.28)';
+        mmCtx.lineWidth   = 0.8;
+        mmCtx.strokeRect(0.5, 0.5, MM_SIZE - 1, MM_SIZE - 1);
+    }
+
+    // ─── MAIN DRAW LOOP ──────────────────────────────────────────
+    function draw(timestamp) {
+        const W   = canvas.width;
+        const H   = canvas.height;
+        const pSX = W / 2;
+        const pSY = H / 2;
+
+        // ── Delta time (dibatasi 100ms agar tidak loncat saat tab tidak aktif) ──
+        const dt = lastTimestamp > 0 ? Math.min(timestamp - lastTimestamp, 100) : 16;
+        lastTimestamp = timestamp;
+
+        // ── Update posisi logika player (tile integer, untuk semua game logic) ──
+        const dir = getJoystickDir();
+        if ((dir.dx !== 0 || dir.dy !== 0) && (timestamp - lastMoveTime >= MOVE_DELAY)) {
+            player.tileX += dir.dx;
+            player.tileY += dir.dy;
+            lastMoveTime  = timestamp;
+            playPlayerStep();
+        }
+
+        // ── Interpolasi posisi render player (smooth, mengejar tileX/Y) ──
+        {
+            const step = PLAYER_MOVE_SPEED * dt / 1000;
+            const pdx  = player.tileX - player.renderX;
+            const pdy  = player.tileY - player.renderY;
+            player.renderX += pdx > 0 ? Math.min(pdx, step) : Math.max(pdx, -step);
+            player.renderY += pdy > 0 ? Math.min(pdy, step) : Math.max(pdy, -step);
+        }
+
+        // ── Update mobs ayam (logika tile integer) ──
+        updateMobs(timestamp);
+
+        // ── Interpolasi posisi render setiap mob (smooth) ──
+        for (const mob of mobs) {
+            const speed = mob.fleeing ? MOB_FLEE_SPEED : MOB_MOVE_SPEED;
+            const step  = speed * dt / 1000;
+            const mdx   = mob.tileX - mob.renderX;
+            const mdy   = mob.tileY - mob.renderY;
+            mob.renderX += mdx > 0 ? Math.min(mdx, step) : Math.max(mdx, -step);
+            mob.renderY += mdy > 0 ? Math.min(mdy, step) : Math.max(mdy, -step);
+        }
+
+        // ── Update suara air sungai 3D ──
+        updateRiverSound(timestamp);
+
+        // ── Cek mob mengenai player ──
+        checkMobHitPlayer(timestamp);
+
+        // Offset kamera — ikuti posisi RENDER player (scroll mulus)
+        const originSX = pSX - player.renderX * TILE_SIZE - TILE_SIZE / 2;
+        const originSY = pSY - player.renderY * TILE_SIZE - TILE_SIZE / 2;
+
+        // ── Cek tangan mengenai mob ──
+        checkHandHit(pSX, pSY, originSX, originSY);
+
+        // ── 1+2. Grid ──
+        drawGrid(originSX, originSY, W, H);
+
+        // ── 2b. Dekorasi dunia (bunga, pohon, kaktus, batu, sungai) ──
+        drawDecorations(originSX, originSY, W, H);
+
+        // ── 3. Radius (ukuran & warna berbeda saat pistol) ──
+        if (weapon.mode === 'pistol') {
+            drawRadius(pSX, pSY, GUN_RADIUS_RANGE,
+                'rgba(255, 60, 30, 0.10)',
+                weapon.isReloading ? 'rgba(255,150,0,0.45)' : 'rgba(255, 80, 50, 0.50)');
+        } else {
+            drawRadius(pSX, pSY);
+        }
+
+        // ── 4. Mobs ayam ──
+        drawMobs(originSX, originSY);
+
+        // ── 4b. Garis keker (laser tembakan) ──
+        drawGunEffects(pSX, pSY, timestamp);
+
+        // ── 5. Segitiga tangan ──
+        drawHand(pSX, pSY);
+
+        // ── 6. Kotak putih (player di atas mob) ──
+        drawPlayer(pSX, pSY);
+
+        // ── 6b. Overlay siklus hari/malam (di atas dunia, di bawah UI) ──
+        drawDayOverlay(W, H, timestamp);
+
+        // ── 6c. Update & gambar hujan (di atas overlay malam, di bawah UI) ──
+        updateRain(timestamp);
+        drawRainOverlay(W, H, timestamp);
+
+        // ── 7. Joystick ──
+        drawJoystick();
+
+        // ── 8. Garis pemisah ──
+        drawDivider(W, H);
+
+        // ── 9. UI Senjata ──
+        drawWeaponSlots(W, timestamp);
+        drawWeaponUI(W, timestamp);
+
+        // ── 9b. Label waktu hari ──
+        drawDayClock(W, timestamp);
+
+        // ── 9c. Nyawa pemain ──
+        drawPlayerLives();
+
+        // ── 10. Minimap ──
+        drawMinimap();
+
+        requestAnimationFrame(draw);
+    }
+
+    // ─── MENU UTAMA (native prompt/alert — TalkBack friendly) ─────
+    const MENU_INFO = {
+        2: 'Profil: Blindcraft oleh Mellonvis Creative. Game aksesibel berbasis audio 3D spatial untuk pemain tunanetra.',
+        3: 'Pengaturan: Fitur pengaturan akan tersedia di versi mendatang.',
+        4: 'Tutorial: Sentuh zona atas layar lalu seret untuk mengarahkan tangan dan menyerang. Sentuh zona bawah layar untuk menggerakkan karakter dengan joystick virtual. Pukul ayam 3 kali untuk mengalahkannya!',
+        5: 'Riset permainan: Game ini menggunakan audio 3D spatial (Web Audio API HRTF) agar pemain tunanetra dapat mendeteksi posisi musuh hanya dari suara. Setiap objek memiliki suara yang mengikuti posisinya di dunia game.',
+    };
+
+    let gameStarted = false;
+
+    function showMenu() {
+        const choice = prompt(
+            'Blindcraft\nGame audio aksesibel untuk tunanetra\n\n' +
+            '1. Main\n' +
+            '2. Profil\n' +
+            '3. Pengaturan\n' +
+            '4. Tutorial\n' +
+            '5. Riset permainan\n\n' +
+            'Ketik angka 1 sampai 5 lalu tekan OK:'
+        );
+
+        // Batal / tutup dialog
+        if (choice === null) {
+            const kembali = confirm('Tekan OK untuk kembali ke menu, atau Batal untuk keluar.');
+            if (kembali) showMenu();
+            return;
+        }
+
+        const n = parseInt(choice.trim());
+        if (isNaN(n) || n < 1 || n > 5) {
+            alert('Pilihan tidak valid. Masukkan angka 1 sampai 5.');
+            showMenu();
+            return;
+        }
+
+        if (n === 1) {
+            // Peringatan: matikan TalkBack sebelum mulai
+            alert(
+                'PERINGATAN SEBELUM BERMAIN\n\n' +
+                'Harap matikan TalkBack (Screen Reader) terlebih dahulu sebelum bermain.\n\n' +
+                'Cara mematikan TalkBack:\n' +
+                'Pengaturan > Aksesibilitas > TalkBack > Matikan\n\n' +
+                'Game ini menggunakan kontrol sentuh khusus yang tidak kompatibel dengan TalkBack.\n\n' +
+                'Tekan OK jika sudah siap bermain.'
+            );
+            // Hentikan backsound menu, mulai game
+            stopBacksound();
+            unlockAudio();
+            if (!gameStarted) {
+                gameStarted  = true;
+                dayStartTime = performance.now(); // mulai siklus hari
+                startGameBGM(); // mulai musik gameplay volume kecil
+                requestAnimationFrame(draw);
+            }
+        } else {
+            alert(MENU_INFO[n]);
+            showMenu(); // kembali ke menu setelah membaca info
+        }
+    }
+
+    // Tampilkan menu saat halaman siap
+    setTimeout(() => showMenu(), 150);
+</script>
+
+</body>
+</html>
