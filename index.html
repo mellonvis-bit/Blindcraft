@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Blindcraft v2.4</title>
+    <title>Blindcraft v2.5</title>
     <style>
         body, html {
             margin: 0;
@@ -1212,14 +1212,16 @@
         const H       = canvas.height;
         const pSX     = W / 2;
         const pSY     = H / 2;
-        const originSX = pSX - player.tileX * TILE_SIZE - TILE_SIZE / 2;
-        const originSY = pSY - player.tileY * TILE_SIZE - TILE_SIZE / 2;
-        const now      = performance.now(); // satu nilai konsisten untuk seluruh fungsi
+        // Gunakan renderX/Y agar sesuai posisi visual (bukan tileX/Y yang sudah maju)
+        const originSX = pSX - player.renderX * TILE_SIZE - TILE_SIZE / 2;
+        const originSY = pSY - player.renderY * TILE_SIZE - TILE_SIZE / 2;
+        const now      = performance.now();
 
         for (let i = mobs.length - 1; i >= 0; i--) {
             const mob   = mobs[i];
-            const mobSX = originSX + mob.tileX * TILE_SIZE + TILE_SIZE / 2;
-            const mobSY = originSY + mob.tileY * TILE_SIZE + TILE_SIZE / 2;
+            // Gunakan renderX/Y mob agar sesuai posisi visual
+            const mobSX = originSX + mob.renderX * TILE_SIZE + TILE_SIZE / 2;
+            const mobSY = originSY + mob.renderY * TILE_SIZE + TILE_SIZE / 2;
 
             // Jarak mob dari pusat player
             const distFromPlayer = Math.sqrt((mobSX - pSX) ** 2 + (mobSY - pSY) ** 2);
@@ -2042,6 +2044,202 @@
         requestAnimationFrame(draw);
     }
 
+    // ─── SISTEM LOADING SCREEN ────────────────────────────────────
+    // Daftar semua file audio yang perlu diunduh
+    const AUDIO_FILES = [
+        'jalan.mp3', 'jalan 1.mp3', 'jalan 2.mp3',
+        'jalan hutan.mp3', 'jalan pasir.mp3',
+        'ayam 1.mp3', 'ayam 2.mp3', 'angin.mp3',
+        'ayam mati.mp3', 'kena.mp3', 'menghindar.mp3',
+        'senjata 1.mp3', 'reload senjata 1.mp3',
+        'tangan.mp3', 'bcksound.mp3', 'air sungai.mp3',
+    ];
+
+    const loadState = {
+        active:  false,
+        loaded:  0,
+        total:   AUDIO_FILES.length,
+        done:    false,
+    };
+    let loadDisplayPct = 0;   // persentase animasi — tidak pernah mundur
+    let loadingRafId   = null;
+
+    // Preload semua file dengan tracking progress per file
+    function preloadAudioWithProgress() {
+        loadState.loaded = 0;
+        loadState.done   = false;
+        const promises = AUDIO_FILES.map(url =>
+            loadBuffer(url)
+                .then(() => { loadState.loaded++; })
+                .catch(() => { loadState.loaded++; }) // file gagal tetap dihitung agar bar tidak stuck
+        );
+        Promise.all(promises).then(() => { loadState.done = true; });
+    }
+
+    // Helper rounded rect dengan fallback untuk browser lama
+    function _rrect(x, y, w, h, r) {
+        const rr = Math.min(r, w / 2, h / 2);
+        if (typeof ctx.roundRect === 'function') {
+            ctx.beginPath();
+            ctx.roundRect(x, y, w, h, rr);
+        } else {
+            ctx.beginPath();
+            ctx.moveTo(x + rr, y);
+            ctx.lineTo(x + w - rr, y);
+            ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+            ctx.lineTo(x + w, y + h - rr);
+            ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+            ctx.lineTo(x + rr, y + h);
+            ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+            ctx.lineTo(x, y + rr);
+            ctx.quadraticCurveTo(x, y, x + rr, y);
+            ctx.closePath();
+        }
+    }
+
+    // Gambar loading screen di canvas
+    function drawLoadingScreen(timestamp) {
+        const W = canvas.width;
+        const H = canvas.height;
+
+        // ── Latar belakang ──
+        const bgGrad = ctx.createLinearGradient(0, 0, 0, H);
+        bgGrad.addColorStop(0, '#080e1c');
+        bgGrad.addColorStop(1, '#0f1a2e');
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, W, H);
+
+        // ── Bintang dekoratif (reuse konstanta STARS) ──
+        ctx.save();
+        for (const [fx, fy] of STARS) {
+            const pulse = 0.45 + Math.sin(timestamp * 0.0009 + fx * 22) * 0.28;
+            ctx.beginPath();
+            ctx.arc(fx * W, fy * H * 0.55, 1.3, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255,255,255,${pulse})`;
+            ctx.fill();
+        }
+        ctx.restore();
+
+        ctx.save();
+        ctx.textAlign = 'center';
+
+        // ── Judul game ──
+        ctx.font        = 'bold 34px sans-serif';
+        ctx.fillStyle   = '#ffffff';
+        ctx.shadowBlur  = 28;
+        ctx.shadowColor = 'rgba(70, 170, 255, 0.85)';
+        ctx.fillText('BLINDCRAFT', W / 2, H / 2 - 90);
+        ctx.shadowBlur  = 0;
+
+        ctx.font      = '12px sans-serif';
+        ctx.fillStyle = 'rgba(150, 195, 230, 0.65)';
+        ctx.fillText('Game audio aksesibel untuk tunanetra', W / 2, H / 2 - 62);
+
+        // ── Hitung persen aktual dari file yang sudah terunduh ──
+        const realPct = Math.min(100, (loadState.loaded / loadState.total) * 100);
+
+        // Animasi display: maju ke target, tidak pernah mundur
+        // Kecepatan normal 0.9 per frame, saat semua selesai lebih cepat ke 100
+        const speed = loadState.done ? 2.2 : 0.9;
+        if (loadDisplayPct < realPct) {
+            loadDisplayPct = Math.min(realPct, loadDisplayPct + speed);
+        }
+        if (loadState.done && loadDisplayPct < 100) {
+            loadDisplayPct = Math.min(100, loadDisplayPct + speed);
+        }
+
+        // ── Bar loading ──
+        const barW = Math.min(W * 0.72, 340);
+        const barH = 10;
+        const barX = W / 2 - barW / 2;
+        const barY = H / 2 - 10;
+        const barR = barH / 2;
+
+        // Latar bar
+        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        _rrect(barX, barY, barW, barH, barR);
+        ctx.fill();
+
+        // Isi bar
+        const fillW = barW * (loadDisplayPct / 100);
+        if (fillW > 1) {
+            // Gradient biru → hijau toska
+            const fillGrad = ctx.createLinearGradient(barX, 0, barX + barW, 0);
+            fillGrad.addColorStop(0, '#2070cc');
+            fillGrad.addColorStop(1, '#38d8a0');
+            ctx.fillStyle = fillGrad;
+            _rrect(barX, barY, fillW, barH, barR);
+            ctx.fill();
+
+            // Shimmer bergerak di atas bar
+            const shimPos   = barX + fillW * ((timestamp % 1400) / 1400);
+            const shimGrad  = ctx.createLinearGradient(shimPos - 40, 0, shimPos + 40, 0);
+            shimGrad.addColorStop(0,   'rgba(255,255,255,0)');
+            shimGrad.addColorStop(0.5, 'rgba(255,255,255,0.30)');
+            shimGrad.addColorStop(1,   'rgba(255,255,255,0)');
+            ctx.fillStyle = shimGrad;
+            _rrect(barX, barY, fillW, barH, barR);
+            ctx.fill();
+
+            // Titik cahaya di ujung bar
+            ctx.beginPath();
+            ctx.arc(barX + fillW, barY + barH / 2, barH * 0.80, 0, Math.PI * 2);
+            ctx.fillStyle   = '#9cf8de';
+            ctx.shadowBlur  = 16;
+            ctx.shadowColor = '#38d8a0';
+            ctx.fill();
+            ctx.shadowBlur  = 0;
+        }
+
+        // ── Label persen ──
+        const pctInt  = Math.floor(loadDisplayPct);
+        ctx.font      = 'bold 15px monospace';
+        ctx.fillStyle = '#a8f0e0';
+        ctx.fillText(pctInt + '%', W / 2, barY + barH + 26);
+
+        // ── Status teks ──
+        ctx.font      = '11px sans-serif';
+        ctx.fillStyle = 'rgba(120,150,175,0.80)';
+        let statusText;
+        if (loadState.done && loadDisplayPct >= 100) {
+            statusText = '✓ Semua aset siap — memulai game...';
+        } else if (loadState.done) {
+            statusText = '✓ Selesai diunduh — menyiapkan game...';
+        } else {
+            statusText = 'Mengunduh aset audio (' + loadState.loaded + ' / ' + loadState.total + ')...';
+        }
+        ctx.fillText(statusText, W / 2, barY + barH + 48);
+
+        // ── Versi & kredit ──
+        ctx.font      = '10px sans-serif';
+        ctx.fillStyle = 'rgba(90,115,140,0.50)';
+        ctx.fillText('Mellonvis Creative  •  v2.5', W / 2, H - 18);
+
+        ctx.restore();
+    }
+
+    // Loop animasi loading screen (berjalan sampai semua file siap & bar penuh)
+    function runLoadingLoop(ts) {
+        resize();
+        drawLoadingScreen(ts);
+        if (loadState.done && loadDisplayPct >= 99.95) {
+            // Semua file terunduh dan bar sudah penuh — mulai game
+            loadingRafId = null;
+            _beginGame();
+            return;
+        }
+        loadingRafId = requestAnimationFrame(runLoadingLoop);
+    }
+
+    // Mulai game setelah loading selesai
+    function _beginGame() {
+        if (gameStarted) return; // guard: jangan mulai dua kali
+        gameStarted  = true;
+        dayStartTime = performance.now();
+        startGameBGM();
+        requestAnimationFrame(draw);
+    }
+
     // ─── MENU UTAMA (native prompt/alert — TalkBack friendly) ─────
     const MENU_INFO = {
         2: 'Profil: Blindcraft oleh Mellonvis Creative. Game aksesibel berbasis audio 3D spatial untuk pemain tunanetra.',
@@ -2063,7 +2261,6 @@
             'Ketik angka 1 sampai 5 lalu tekan OK:'
         );
 
-        // Batal / tutup dialog
         if (choice === null) {
             const kembali = confirm('Tekan OK untuk kembali ke menu, atau Batal untuk keluar.');
             if (kembali) showMenu();
@@ -2078,7 +2275,6 @@
         }
 
         if (n === 1) {
-            // Peringatan: matikan TalkBack sebelum mulai
             alert(
                 'PERINGATAN SEBELUM BERMAIN\n\n' +
                 'Harap matikan TalkBack (Screen Reader) terlebih dahulu sebelum bermain.\n\n' +
@@ -2087,18 +2283,29 @@
                 'Game ini menggunakan kontrol sentuh khusus yang tidak kompatibel dengan TalkBack.\n\n' +
                 'Tekan OK jika sudah siap bermain.'
             );
-            // Hentikan backsound menu, mulai game
+
             stopBacksound();
-            unlockAudio();
-            if (!gameStarted) {
-                gameStarted  = true;
-                dayStartTime = performance.now(); // mulai siklus hari
-                startGameBGM(); // mulai musik gameplay volume kecil
-                requestAnimationFrame(draw);
+
+            // Unlock AudioContext — masih dalam konteks interaksi pengguna (setelah alert)
+            if (!audioUnlocked) {
+                audioUnlocked = true;
+                try { getAudioCtx().resume(); } catch(e) {}
+            }
+
+            // Mulai loading screen (hanya sekali)
+            if (!gameStarted && !loadState.active) {
+                loadState.active  = true;
+                loadDisplayPct    = 0;
+                loadState.loaded  = 0;
+                loadState.done    = false;
+                // Mulai animasi loading screen
+                loadingRafId = requestAnimationFrame(runLoadingLoop);
+                // Mulai unduh semua file audio secara paralel (tidak await di sini)
+                preloadAudioWithProgress();
             }
         } else {
             alert(MENU_INFO[n]);
-            showMenu(); // kembali ke menu setelah membaca info
+            showMenu();
         }
     }
 
